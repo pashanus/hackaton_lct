@@ -1,0 +1,63 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,readFile,writeFile} from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import {once} from 'node:events';
+import http from 'node:http';
+import {createApp,makeLlm} from '../server.mjs';
+import {templates,createSession} from '../engine.mjs';
+async function setup(t,options={}) {const dir=await mkdtemp(path.join(os.tmpdir(),'arena-test-'));const app=await createApp({dataDir:dir,...options});app.listen(0,'127.0.0.1');await once(app,'listening');t.after(()=>new Promise(resolve=>app.close(resolve)));const url=`http://127.0.0.1:${app.address().port}`;const request=async(endpoint,body,headers={})=>{const res=await fetch(url+endpoint,{method:body===undefined?'GET':'POST',headers:{'Content-Type':'application/json',...headers},...(body===undefined?{}:{body:JSON.stringify(body)})});return{status:res.status,body:await res.json()};};return{app,dir,url,request};}
+test('API: конфигурация, новая попытка, действие и история',async t=>{const{request,dir}=await setup(t);let r=await request('/api/bootstrap');assert.equal(r.body.configs.length,2);assert.equal(r.body.llmAvailable,false);r=await request('/api/config',{...templates[0],budget:100});assert.equal(r.status,200);r=await request('/api/sessions',{scenarioId:'supply'});const id=r.body.id;assert.equal(r.body.config.budget,100);r=await request(`/api/sessions/${id}/actions`,{type:'interest'});assert.equal(r.body.turn,1);r=await request(`/api/sessions/${id}/actions`,{type:'withdraw'});assert.equal(r.body.status,'completed');assert.equal(JSON.parse(await readFile(path.join(dir,'arena.json'),'utf8')).sessions.length,1);});
+test('Повтор сохраняет исходные условия после изменения шаблона',async t=>{const{request}=await setup(t);const first=(await request('/api/sessions',{scenarioId:'supply'})).body;await request('/api/config',{...templates[0],budget:80});const repeat=(await request('/api/sessions',{previousId:first.id})).body;assert.equal(repeat.config.budget,110);assert.equal(repeat.previousId,first.id);assert.equal(repeat.turn,0);});
+test('API создаёт ветку с сохранённым состоянием и прежними настройками; родитель не меняется',async t=>{
+ const{request,dir}=await setup(t);
+ const first=(await request('/api/sessions',{scenarioId:'supply'})).body;
+ await request(`/api/sessions/${first.id}/actions`,{type:'interest'});
+ const original=(await request(`/api/sessions/${first.id}/actions`,{type:'withdraw'})).body;
+ await request('/api/config',{...templates[0],budget:80});
+ const r=await request('/api/sessions',{previousId:first.id,beforeTurn:2});
+ assert.equal(r.status,201);assert.equal(r.body.turn,1);assert.equal(r.body.state.trust,65);
+ assert.equal(r.body.config.budget,110);assert.equal(r.body.status,'active');
+ assert.equal(r.body.checkpoints,undefined);assert.equal(r.body.config.goal,undefined);
+ assert.equal(r.body.fork.beforeTurn,2);assert.equal(r.body.previousId,first.id);
+ assert.deepEqual((await request(`/api/sessions/${first.id}`)).body,original);
+ const saved=JSON.parse(await readFile(path.join(dir,'arena.json'),'utf8'));
+ assert.equal(saved.sessions.length,2);assert.equal(saved.sessions[1].checkpoints.length,1);
+ const other=await createApp({dataDir:dir});other.listen(0,'127.0.0.1');await once(other,'listening');t.after(()=>new Promise(resolve=>other.close(resolve)));
+ const persisted=await (await fetch(`http://127.0.0.1:${other.address().port}/api/sessions/${r.body.id}`)).json();
+ assert.deepEqual(persisted,r.body);
+});
+test('API отклоняет несуществующую точку без создания попытки',async t=>{
+ const{request}=await setup(t);
+ const s=(await request('/api/sessions',{scenarioId:'supply'})).body;
+ for(const body of [{scenarioId:'supply',beforeTurn:1},{previousId:s.id,beforeTurn:1},{previousId:s.id,beforeTurn:'1'},{previousId:'missing',beforeTurn:1}])assert.equal((await request('/api/sessions',body)).status,400);
+ assert.equal((await request('/api/bootstrap')).body.sessions.length,1);
+});
+test('Данные восстанавливаются при новом экземпляре сервера',async t=>{const{request,dir}=await setup(t);const first=(await request('/api/sessions',{scenarioId:'project'})).body;await request(`/api/sessions/${first.id}/actions`,{type:'interest'});const other=await createApp({dataDir:dir});other.listen(0,'127.0.0.1');await once(other,'listening');t.after(()=>new Promise(r=>other.close(r)));const r=await fetch(`http://127.0.0.1:${other.address().port}/api/sessions/${first.id}`);assert.equal((await r.json()).turn,1);});
+test('Ошибка AI сохраняет ход с явным обозначением запасного режима',async t=>{const{request}=await setup(t,{llm:async()=>{throw new Error('timeout');}});const s=(await request('/api/sessions',{scenarioId:'supply',mode:'ai'})).body;const r=await request(`/api/sessions/${s.id}/actions`,{type:'interest'});assert.equal(r.status,200);assert.equal(r.body.messages.at(-1).source,'guided-fallback');assert.ok(r.body.messages.at(-1).notice);});
+test('AI переформулирует реплику, сохраняя проверенные условия',async t=>{const{request}=await setup(t,{llm:async()=> 'Давайте обсудим предложенные условия.'});const s=(await request('/api/sessions',{scenarioId:'supply',mode:'ai'})).body;const r=await request(`/api/sessions/${s.id}/actions`,{type:'interest'});assert.equal(r.body.messages.at(-1).source,'ai');assert.match(r.body.messages.at(-1).ruleText,/предоплат/);});
+test('Неизвестный сценарий и невалидные поля не меняют хранилище',async t=>{const{request}=await setup(t);assert.equal((await request('/api/sessions',{scenarioId:'x'})).status,400);assert.equal((await request('/api/config',{...templates[0],budget:-1})).status,400);assert.equal((await request('/api/bootstrap')).body.sessions.length,0);});
+test('API: игровое дело сохраняет ресурс, эпилог и подготовку при повторе',async t=>{
+ const{request,dir,url}=await setup(t);
+ const boot=(await request('/api/bootstrap')).body;assert.equal(boot.gameCatalog.operations.length,2);assert.equal(boot.gameCatalog.endings.length,6);
+ const s=(await request('/api/sessions',{scenarioId:'supply',game:{operationId:'supply',kit:'reserve'}})).body;
+ assert.equal(s.game.used,false);assert.equal(s.game.motive,null);
+ await request(`/api/sessions/${s.id}/actions`,{type:'tool'});
+ await request(`/api/sessions/${s.id}/actions`,{type:'offer',offer:{price:104,day:10,advance:30,partial:false}});
+ const done=(await request(`/api/sessions/${s.id}/actions`,{type:'accept'})).body;
+ assert.equal(done.result.game.ending.id,'resilient');assert.equal(done.game.used,true);
+ const repeat=(await request('/api/sessions',{previousId:s.id})).body;
+ assert.equal(repeat.game.kit,'reserve');assert.equal(repeat.game.used,false);
+ const stored=JSON.parse(await readFile(path.join(dir,'arena.json'),'utf8'));assert.equal(stored.sessions[0].result.game.ending.id,'resilient');
+ assert.equal((await fetch(url+'/game-ui.js')).status,200);assert.equal((await fetch(url+'/game.css')).status,200);
+});
+test('API: нельзя выбрать несуществующий ресурс или ресурс другого дела',async t=>{
+ const{request}=await setup(t);
+ for(const game of [{operationId:'project',kit:'intel'},{operationId:'supply',kit:'fake'}])assert.equal((await request('/api/sessions',{scenarioId:'supply',game})).status,400);
+ assert.equal((await request('/api/bootstrap')).body.sessions.length,0);
+});
+test('Два пользователя имеют независимые сессии',async t=>{const{request}=await setup(t);const sessions=await Promise.all([request('/api/sessions',{scenarioId:'supply'}),request('/api/sessions',{scenarioId:'project'})]);const a=sessions[0].body,b=sessions[1].body;await request(`/api/sessions/${a.id}/actions`,{type:'pressure'});assert.equal((await request(`/api/sessions/${b.id}`)).body.turn,0);});
+test('Origin, доступ к файлам и неизвестные маршруты ограничены',async t=>{const{request,url}=await setup(t);assert.equal((await request('/api/sessions',{scenarioId:'supply'},{Origin:'https://example.com'})).status,403);assert.equal((await fetch(url+'/data/arena.json')).status,404);assert.equal((await fetch(url+'/server.mjs')).status,404);assert.equal((await fetch(url+'/.env')).status,404);assert.equal((await request('/api/unknown')).status,404);});
+test('Повреждённое хранилище не перезаписывается',async()=>{const dir=await mkdtemp(path.join(os.tmpdir(),'arena-corrupt-'));await writeFile(path.join(dir,'arena.json'),'{broken');await assert.rejects(createApp({dataDir:dir}),/Файл сохранён/);assert.equal(await readFile(path.join(dir,'arena.json'),'utf8'),'{broken');});
+test('Адаптер chat-completions проверяется на локальном имитаторе',async t=>{let received;const provider=http.createServer(async(req,res)=>{let raw='';for await(const c of req)raw+=c;received=JSON.parse(raw);res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{message:{content:'Готов обсудить ваши условия.'}}]}));});provider.listen(0,'127.0.0.1');await once(provider,'listening');t.after(()=>new Promise(r=>provider.close(r)));const fn=makeLlm({url:`http://127.0.0.1:${provider.address().port}/v1/chat/completions`,model:'test'});assert.equal(await fn(createSession(templates[0]),'Разрешённая реплика'),'Готов обсудить ваши условия.');assert.equal(received.model,'test');assert.match(received.messages[0].content,/Разрешённая реплика/);});
